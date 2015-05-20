@@ -21,9 +21,9 @@ the focus has been on getting the gradients to work.
 
 Requirements
 ------------
-Python (tested with 2.7.9)
-Theano (tested with 0.7)
-speech_dtw (optional; see framework/cython_dtw.py for details)
+* Python (tested with 2.7.9)
+* Theano (tested with 0.7)
+* speech_dtw (optional; see framework/cython_dtw.py for details)
 
 Also all of Theano's dependecies, esp. numpy.
 
@@ -33,9 +33,9 @@ Run dtw.py. See the comments at the top of that file for more information.
 
 Collaborators
 -------------
-Daniel Renshaw
-Herman Kamper
-Sharon Goldwater
+* Daniel Renshaw
+* Herman Kamper
+* Sharon Goldwater
 
 License
 -------
