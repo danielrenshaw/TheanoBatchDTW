@@ -4,24 +4,30 @@
 A testbed for developing a Theano batch DTW implementation. Computes DTW distances but does not currently output the
 back-traced optimal paths. The intent of this implementation is not speed but gradients. The hope is to use Theano's
 symbolic differentiation capability to compute the gradient of a cost function with respect to parameters where that
-cost function might be "min DTW(x, y)" and where x and/or y are functions of the parameters.
+cost function might be "min DTW(x1, x2)" and where x1 and/or x2 are functions of the parameters.
 
 The implementation works fully for individual sequence pairs but is 100 times slower than a reference Cython DTW
-implementation. In principle it should be possible to submit batches of sequence pairs and compute the DTW distances for
-the batch concurrently (e.g. on a GPU). In practice this implementation can compute the distances for a batch correctly
-but fails to provide a correct gradient. NaNs and infs appear in the gradients where they should not and no method has
-been found to eliminate these pesky intrusions.
+implementation. Better speed is achieved by computing many sequence pair DTWs in a (mini-)batch mode. Typical timings,
+in seconds, for computing the DTW between 1000 sequence pairs is:
 
-NOTE: The DTW distances are correct even in batch mode. It's only the gradients which are wrong.
+ * Cython: 0.5813
+ * Theano 2D: 58.86
+ * Theano 3D, batch size=1: 187.6
+ * Theano 3D, batch size=10: 24.23
+ * Theano 3D, batch size=100: 4.778
+ * Theano 3D, batch size=1000: 2.628
 
-This file, and the dependencies in the framework folder, contains everything needed to exhibit the gradient problem.
-With enable_grads=True applied in the _test_main call at the very end of this script you will experience exceptions
-warning of unwanted NaNs.
+Note that the 3D (batching) version is slower than the 2D version when the batch size is too small. Little attempt has
+been made to optimize either Theano implementation as the focus has been on getting the gradients to work.
+
+To produce your own timings, just run this script. By default gradients are disabled. The code slows down substantially
+when gradients are enabled but that is not a fair comparison with the Cython version since that is incapable of
+computing gradients.
 
 The parameters in the _test_main call at the end of this script are explained here:
 
 debug_level:
-0: essentially off, though assertions still enabled
+0: essentially off, though assertions still enabled if enable_value_checks=True
 1: additional value checks enabled but general printing disabled.
 2: All checks and printing enabled.
 
@@ -33,18 +39,23 @@ False: only a couple of simpler configurations are run; intended for speeding up
 
 enable_grads:
 True: Inputs are projected via a parameter matrix before being passed to DTW. Gradients of the loss function (min DTW)
-      with respect to the parameter matrix are computed and tested. Currently not working correctly.
+      with respect to the parameter matrix are computed and tested.
 False: Inputs are passed directly to DTW without transformation. Gradients are not computed. For testing the plain
        DTW operation.
 
-large_value: A value to use as if it were the same as positive infinity. numpy.inf works fine as long as gradients are
-             not wanted. If gradients are wanted, may need to change this value to a large finite value to help prevent
-             unwanted NaNs or infs appearing in the gradient (e.g. set to 1e300).
+enable_value_checks:
+True: Checks that the values produced by the three implementations are close (via numpy.allclose). Should normally be
+      enabled but available to be disabled to aid development and debugging of temporarily invalid variations.
+False: Values checks are disabled.
 
-The Theano implementation is slow! While the Cython implementation can compute the DTW distance between 100 sequence
-pairs in 0.079 seconds, the nonbatch Theano implementation takes 19.5 seconds and the fully batched Theano
-implementation takes 0.5 seconds. Little attempt has been made to optimize either Theano implementation at this point as
-the focus has been on getting the gradients to work.
+eps:
+Previous versions of this code computed the DTW values correctly but failed to compute the gradients. The problem
+manifested itself as NaN values in the gradients. The problem was tracked down to division by zero which only occurred
+in the gradient computation graph seemingly outside the bounds of the divide by zero checks in the code proper. The
+solution is to use a minimum value inside the sqrt operation of the magnitude function and in the computation of the
+divisor in the cosine distance function. By default this value equals the machine epsilon for the Python float data
+type.
+
 
 Synthetic data is generated to test and compare the implementations. Simpler synthetic data is used as Theano test
 values which, in combination with a custom Debug operation (see debug_op.py in the framework package), allows quick
@@ -57,9 +68,10 @@ column for each position in x2.
 import os
 import time
 
-os.environ['THEANO_FLAGS'] = 'device=cpu,openmp=False,floatX=float64'
-# ,exception_verbosity=high
-# ,optimizer=None
+os.environ['THEANO_FLAGS'] = 'device=cpu,openmp=True,floatX=float64'
+# os.environ['THEANO_FLAGS'] = 'device=cpu,openmp=False,floatX=float32,warn_float64=raise,compute_test_value=raise,' \
+#                              'on_opt_error=raise,on_shape_error=raise,numpy.seterr_all=warn,optimizer=None,' \
+#                              'exception_verbosity=high'
 
 import numpy
 
@@ -69,16 +81,17 @@ import theano.ifelse
 import theano.printing
 import theano.scan_module
 import theano.scan_module.scan_op
-import theano.tensor
+import theano.tensor as tt
 import theano.tensor.extra_ops
 import framework.debug_op
-import framework.distance
 import framework.cython_dtw
 import framework.utility
 
+DTYPE_INT64 = 'int64'
 
-def _debug(node, name, debug_level, check_not_all_nan=True, check_not_any_nan=True, check_not_all_inf=False,
-           check_not_any_inf=False, raise_on_failed_nan_check=True, raise_on_failed_inf_check=True):
+
+def _debug(node, name, debug_level, check_not_all_nan=True, check_not_any_nan=True, check_not_all_inf=True,
+           check_not_any_inf=True, raise_on_failed_nan_check=True, raise_on_failed_inf_check=True):
     """
     Allows the default parameters for the framework's debug operation to be altered without editing any other users.
     The "check" parameters only affect the expression, not the expression's gradient.
@@ -109,135 +122,78 @@ def _create_dtw_inner_step(debug_level):
     :return: A function that can be used inside theano.scan to compute the DTW inner steps.
     """
 
-    def dtw_inner_step(distance, matching_cost, insertion_cost, deletion_cost):
-        """
-        The DTW inner step. To be called in a theano.scan operation that iterates over a single slice of distance(s)
-        corresponding to a single temporal slice of x2. This is a symbolic operation: all parameters must be symbolic
-        and the return value is symbolic.
+    def dtw_inner_step(x2_index, d_slice_slice, insert_cost, x1_length, x2_length, x1_index, previous_cost_row):
+        assert x2_index.ndim == 0
+        assert 0 <= d_slice_slice.ndim <= 1
+        assert insert_cost.ndim == d_slice_slice.ndim
+        assert x1_length.ndim == d_slice_slice.ndim
+        assert x2_length.ndim == d_slice_slice.ndim
+        assert x1_index.ndim == 0
+        assert previous_cost_row.ndim == d_slice_slice.ndim + 1
 
-        If x1 and x2 were 2D then all four parameters will be scalars; if x1 and x2 were 3D then the parameters will be
-        vectors of size equal to the batch size (i.e. x1.shape[1] == x2.shape[1]).
+        x2_index = _debug(x2_index, 'dtw_inner_step.x2_index', debug_level)
+        d_slice_slice = _debug(d_slice_slice, 'dtw_inner_step.d_slice_slice', debug_level)
+        insert_cost = _debug(insert_cost, 'dtw_inner_step.insert_cost', debug_level)
 
-        :param distance: The distance(s) for the current position in the DTW dynamic grid chart.
-        :param matching_cost: The cost(s) computed in the previous DTW outer iteration and at the previous x1 position
-                              (i.e. the cost(s) found moving one step up and one step left in the DTW dynamic
-                              programming chart).
-        :param insertion_cost: The cost(s) computed in the previous DTW outer iteration at the same x1 offset (i.e. the
-                               cost(s) found moving one step left in the DTW dynamic programming chart).
-        :param deletion_cost: The previous cost(s) in the current x2 slice (i.e. the cost(s) found moving one step up in
-                              the DTW dynamic programming chart).
-        :return: The result of computing "distance + min(matching_cost, insertion_cost, deletion_cost)".
-        """
+        delete_cost = _debug(previous_cost_row[x2_index], 'dtw_inner_step.delete_cost', debug_level)
+        match_cost = _debug(previous_cost_row[x2_index - 1], 'dtw_inner_step.match_cost', debug_level)
+        assert delete_cost.ndim == d_slice_slice.ndim
+        assert match_cost.ndim == d_slice_slice.ndim
 
-        assert distance.ndim == matching_cost.ndim == insertion_cost.ndim == deletion_cost.ndim
-        distance = _debug(distance, 'dtw_inner_step.distance', debug_level)
-        matching_cost = _debug(matching_cost, 'dtw_inner_step.matching_cost', debug_level)
-        insertion_cost = _debug(insertion_cost, 'dtw_inner_step.insertion_cost', debug_level)
-        deletion_cost = _debug(deletion_cost, 'dtw_inner_step.deletion_cost', debug_level)
-        min_cost = _debug(theano.tensor.min(theano.tensor.stack(matching_cost, insertion_cost, deletion_cost), axis=0),
+        min_cost = _debug(tt.min(tt.stack(insert_cost, delete_cost, match_cost), axis=0),
                           'dtw_inner_step.min_cost', debug_level)
-        assert min_cost.ndim == distance.ndim
-        cost = _debug(distance + min_cost, 'dtw_inner_step.cost', debug_level)
-        assert cost.ndim == distance.ndim
-        return cost
+        assert min_cost.ndim == d_slice_slice.ndim
+
+        in_first_row = _debug(tt.eq(x1_index, 0), 'dtw_inner_step.in_first_row', debug_level)
+        in_first_column = _debug(tt.eq(x2_index, 0), 'dtw_inner_step.in_first_column', debug_level)
+        assert in_first_row.ndim == 0
+        assert in_first_column.ndim == 0
+
+        cost = _debug(
+            d_slice_slice + tt.switch(in_first_row, insert_cost, tt.switch(in_first_column, delete_cost, min_cost)),
+            'dtw_inner_step.cost', debug_level)
+        assert cost.ndim == d_slice_slice.ndim
+
+        length_filtered_cost = _debug(
+            tt.switch(tt.bitwise_and(tt.lt(x1_index, x1_length), tt.lt(x2_index, x2_length)), cost, 0.),
+            'dtw_inner_step.length_filtered_cost', debug_level)
+        assert length_filtered_cost.ndim == d_slice_slice.ndim
+
+        return length_filtered_cost
 
     return dtw_inner_step
 
 
-def _create_dtw_outer_step(distance_function, large_value, debug_level):
+def _create_dtw_outer_step(distance_function, debug_level):
     """
     Creates a DTW outer step function given requested configuration settings.
 
     :param distance_function: A symbolic function for computing the distance between sequence elements such as those
                               found in framework.distance (e.g. cosine, Euclidean, etc.).
-    :param large_value: A real scalar value (already been cast to the appropriate dtype) that denotes infinite distance.
-                        In principle we would like this to be numpy.inf but is parameterised here in case this padding
-                        value is contributing to the NaN/inf-gradient problem.
     :param debug_level: The debug level to use (see above for explanation).
     :return: A function that can be used inside theano.scan to compute the DTW outer steps.
     """
 
     assert distance_function is not None
-    assert large_value is not None
-    dtype = framework.utility.get_standard_dtype()
 
-    def dtw_outer_step(x2_index, x2_temporal_slice, previous_costs, previous_best_costs, x1, x1_lengths, x2_lengths):
-        """
-        The DTW outer step. To be called in a theano.scan operation that iterates over all temporal slices of x2. This
-        is a symbolic operation: all parameters must be symbolic and the return value is symbolic.
+    def dtw_outer_step(x1_index, d_slice, previous_cost_row, x1_length, x2_length):
+        assert x1_index.ndim == 0
+        assert 1 <= d_slice.ndim <= 2
+        assert previous_cost_row.ndim == d_slice.ndim
+        assert x1_length.ndim == d_slice.ndim - 1
+        assert x2_length.ndim == d_slice.ndim - 1
 
-        :param x2_index: The index of the x2 slice being processed in this iteration. Used to identify x2 sequences that
-                         are padded out to the necessary tensor size.
-        :param x2_temporal_slice: The slice of x2 being processed in this iteration.
-        :param previous_costs: The costs (which may contain padding values) from the previous iteration, used for
-                               matching and insertion costs inthis iteration.
-        :param previous_best_costs: The best costs found so far. Not affected by inf padding.
-        :param x1: The whole x1 matrix against which the current x2 slice will be compared when computing distances.
-        :param x1_lengths: The lengths of the x1 sequences in the current batch (to identify where padding is used).
-        :param x2_lengths: The lengths of the x2 sequences in the current batch (to identify where padding is used).
-        :return: The costs computed for the current x2 slice and the potentially updated best costs for each item in the
-                 batch.
-        """
+        x1_index = _debug(x1_index, 'dtw_outer_step.x1_index', debug_level)
+        d_slice = _debug(d_slice, 'dtw_outer_step.d_slice', debug_level)
+        previous_cost_row = _debug(previous_cost_row, 'dtw_outer_step.previous_cost_row', debug_level)
 
-        ndim = x1.ndim
-        assert 2 <= ndim == (x2_temporal_slice.ndim + 1) <= 3
-
-        # Debug wrap the variable inputs
-        x2_index = _debug(x2_index, 'dtw_outer_step.x2_index', debug_level)
-        x2_temporal_slice = _debug(x2_temporal_slice, 'dtw_outer_step.x2_temporal_slice', debug_level)
-        previous_costs = _debug(previous_costs, 'dtw_outer_step.previous_costs', debug_level)
-        previous_best_costs = _debug(previous_best_costs, 'dtw_outer_step.previous_best_costs', debug_level)
-
-        # Compute distances between the single-frame slice of x2 and all frames in x1
-        x2_temporal_slice = theano.tensor.stack(x2_temporal_slice)
-        distances = _debug(distance_function(x1, x2_temporal_slice), 'dtw_outer_step.distances.1', debug_level,
-                           check_not_any_nan=False)
-
-        # Mask out the distances for shorter x1 sequences
-        mask = _debug(
-            (theano.tensor.zeros_like(distances, dtype='int32').T + theano.tensor.arange(x1.shape[0])).T >= x1_lengths,
-            'dtw_outer_step.mask1', debug_level)
-        distances = _debug(
-            theano.tensor.set_subtensor(distances[theano.tensor.nonzero(mask)], large_value),
-            'dtw_outer_step.distances.2', debug_level, check_not_any_nan=False)
-
-        # Mask out the distances for shorter x2 sequences (and init costs)
-        if ndim == 2:
-            distances = _debug(
-                theano.tensor.switch(x2_lengths <= x2_index, large_value, distances),
-                'dtw_outer_step.distances.3a', debug_level)
-            large_values = large_value
-        elif ndim == 3:
-            mask = _debug(x2_index >= (theano.tensor.zeros_like(distances, dtype='int32') + x2_lengths),
-                          'dtw_outer_step.mask2', debug_level)
-            distances = _debug(
-                theano.tensor.set_subtensor(distances[theano.tensor.nonzero(mask)], large_value),
-                'dtw_outer_step.distances.3b', debug_level)
-            large_values = theano.tensor.zeros_like(x1[0, :, 0], dtype=dtype) + large_value
-        else:
-            raise Exception('Unsupported number of dimensions: ' + str(ndim))
-
-        # Execute the inner step for each of the distances just computed. See dtw_inner_step for an explanation of the
-        # other sequences and initial output values.
-        results, _ = theano.scan(_create_dtw_inner_step(debug_level),
-                                 sequences=[distances, previous_costs[:-1], previous_costs[1:]],
-                                 outputs_info=[large_values])
-
-        # Prepend the costs we've just computed with large values to initialize the matching and insertion costs in the
-        # next outer step iteration.
-        costs = _debug(theano.tensor.concatenate([[large_values], results]), 'dtw_outer_step.costs', debug_level)
-
-        # Identify the best cost(s). We assume non-batch inputs are not padded.
-        if ndim == 2:
-            best_costs = results[-1]
-        elif ndim == 3:
-            best_costs = theano.tensor.switch(x2_lengths <= x2_index, previous_best_costs,
-                                              results[x1_lengths - 1, theano.tensor.arange(distances.shape[1])])
-        else:
-            raise Exception('Unsupported number of dimensions: ' + str(ndim))
-
-        best_costs = _debug(best_costs, 'dtw_outer_step.best_costs', debug_level, check_not_any_inf=True)
-        return costs, best_costs
+        x2_indexes = tt.arange(d_slice.shape[0], dtype=DTYPE_INT64)
+        results, _ = theano.scan(
+            _create_dtw_inner_step(debug_level),
+            sequences=[x2_indexes, d_slice],
+            outputs_info=[tt.zeros_like(d_slice[0], dtype=theano.config.floatX)],
+            non_sequences=[x1_length, x2_length, x1_index, previous_cost_row])
+        return results
 
     return dtw_outer_step
 
@@ -254,13 +210,41 @@ def _swap(comparison, a, b, name_a, name_b, debug_level):
     :param debug_level: The debug level to use (see above for explanation).
     :return: The two Debug wrapped items which may have been swapped.
     """
-    c = _debug(theano.ifelse.ifelse(comparison, b, a), 'theano_symbolic_dtw.%s' % name_a, debug_level)
-    d = _debug(theano.ifelse.ifelse(comparison, a, b), 'theano_symbolic_dtw.%s' % name_b, debug_level)
+    c = _debug(theano.ifelse.ifelse(comparison, b, a), '_swap.%s' % name_a, debug_level)
+    d = _debug(theano.ifelse.ifelse(comparison, a, b), '_swap.%s' % name_b, debug_level)
     return c, d
 
 
-def theano_symbolic_dtw(x1, x2, x1_lengths, x2_lengths, distance_function=framework.distance.cosine, normalize=True,
-                        large_value=1e300, debug_level=None):
+def transpose_and_pad(x1, x2):
+    return x1.dimshuffle(range(x1.ndim - 1, 0, -1) + ['x', 0]), x2.dimshuffle(range(x2.ndim - 1, -1, -1) + ['x'])
+
+
+def magnitude(x, eps):
+    # We must use a minimum value inside the sqrt to avoid a NaN in the gradient
+    return tt.sqrt(tt.maximum(tt.sqr(x).sum(x.ndim - 1), eps))
+
+
+def euclidean(x1, x2, eps):
+    assert x1.ndim == x2.ndim
+    x1, x2 = x1.dimshuffle([0, 'x'] + range(1, x1.ndim)), x2.dimshuffle(['x'] + range(x2.ndim))
+    result = magnitude(x1 - x2, eps)
+    assert result.ndim == x1.ndim - 1
+    return result
+
+
+def cosine(x1, x2, eps):
+    assert x1.ndim == x2.ndim
+    magnitudes = transpose_and_pad(magnitude(x1, eps), magnitude(x2, eps))
+    # We must use a minimum value to avoid a NaN in the gradient
+    divisor = tt.maximum(magnitudes[0] * magnitudes[1], eps)
+    x1, x2 = transpose_and_pad(x1, x2)
+    result = tt.switch(tt.neq(divisor, 0.), 1. - (x1 * x2).sum(axis=0) / divisor, 0.).T
+    assert result.ndim == x1.ndim - 1
+    return result
+
+
+def theano_symbolic_dtw(x1, x2, x1_lengths, x2_lengths, distance_function=cosine, normalize=True, debug_level=None,
+                        eps=numpy.finfo(float).eps):
     """
     A symbolic implementation of DTW that supports batches of sequence pairs.
 
@@ -275,11 +259,13 @@ def theano_symbolic_dtw(x1, x2, x1_lengths, x2_lengths, distance_function=framew
     :param distance_function: The symbolic distance function to use (e.g. a reference to a function in
                               framework.distance).
     :param normalize: Whether the DTW distances should be sequence length normalized.
-    :param large_value: A value to stand in for positive infinity when padding the distances tensor. Can be numpy.inf if
-                        you don't care about gradients.
     :param debug_level: The debug level to use (see above for explanation).
+    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon by default.
     :return: The DTW distances for every sequence pair in the batch.
     """
+
+    if eps is None:
+        eps = numpy.finfo(float).eps
 
     assert 0 <= x1_lengths.ndim == x2_lengths.ndim <= 1
     assert isinstance(normalize, bool)
@@ -288,42 +274,29 @@ def theano_symbolic_dtw(x1, x2, x1_lengths, x2_lengths, distance_function=framew
     assert 2 <= ndim == x2.ndim <= 3
 
     # Ensure x2 is the shorter input to minimize the number of scan iterations
-    x1_length, x2_length = x1.shape[0], x2.shape[0]
-    x1_shorter_than_x2 = theano.tensor.le(x1_length, x2_length)
-
+    x1_shorter_than_x2 = tt.le(x1.shape[0], x2.shape[0])
     x1, x2 = _swap(x1_shorter_than_x2, x1, x2, 'x1', 'x2', debug_level)
     x1_lengths, x2_lengths = _swap(x1_shorter_than_x2, x1_lengths, x2_lengths, 'x1_lengths', 'x2_lengths', debug_level)
-    x1_length, x2_length = _swap(x1_shorter_than_x2, x1_length, x2_length, 'x1_length', 'x2_length', debug_level)
 
-    dtype = framework.utility.get_standard_dtype()
-    large_value = numpy.dtype(dtype).type(large_value)
-    zero = numpy.dtype(dtype).type(0.)
-
-    if ndim == 2:
-        # Dimensions: temporal position, embedding position
-        initial_best_costs = zero
-        initial_costs = theano.tensor.zeros_like(x1[:, 0], dtype=dtype) + large_value
-    elif ndim == 3:
-        # Dimensions: temporal position, batch position, embedding position
-        initial_best_costs = theano.tensor.zeros_like(x1[0, :, 0], dtype=dtype)
-        initial_costs = theano.tensor.zeros_like(x1[:, :, 0], dtype=dtype) + large_value
-    else:
-        raise Exception('Unsupported number of dimensions: ' + str(ndim))
-
-    indexes = _debug(theano.tensor.arange(x2_length), 'theano_symbolic_dtw.indexes', debug_level)
-    initial_costs = theano.tensor.concatenate([[initial_best_costs], initial_costs])
+    # Compute distances between x1 sequences and paired x2 sequences
+    d = distance_function(x1, x2, eps)
 
     # Iterate over the temporal slices of x2. See dtw_outer_step for an explanation of the other inputs to this scan
     # operation
+    x1_indexes = tt.arange(x1.shape[0], dtype=DTYPE_INT64)
     results, _ = theano.scan(
-        _create_dtw_outer_step(distance_function, large_value, debug_level),
-        sequences=[indexes, x2], outputs_info=[initial_costs, initial_best_costs],
-        non_sequences=[x1, x1_lengths, x2_lengths])
-    result = _debug(results[-1][-1], 'theano_symbolic_dtw.result', debug_level, check_not_any_inf=True)
+        _create_dtw_outer_step(distance_function, debug_level),
+        sequences=[x1_indexes, d],
+        outputs_info=[tt.zeros_like(x2[:, :, 0] if x2.ndim == 3 else x2[:, 0], dtype=theano.config.floatX)],
+        non_sequences=[x1_lengths, x2_lengths])
+    result = results[x1_lengths - 1, x2_lengths - 1, tt.arange(x1.shape[1])] if x2.ndim == 3 else results[
+        x1_lengths - 1, x2_lengths - 1]
+    result = _debug(result, 'theano_symbolic_dtw.result', debug_level)
+    assert result.ndim == x1_lengths.ndim
 
     # Length normalize the distances if requested to do so
     if normalize:
-        result = _debug(result / theano.tensor.cast(x1_lengths + x2_lengths, dtype=dtype),
+        result = _debug(result / tt.cast(x1_lengths + x2_lengths, dtype=framework.utility.get_standard_dtype()),
                         'theano_symbolic_dtw.norm_result', debug_level)
 
     return result
@@ -383,13 +356,13 @@ def _var(name, test_value_shape, debug_name_prefix, debug_level, dtype=None,
         dtype = framework.utility.get_standard_dtype()
 
     if len(test_value_shape) == 0:
-        x = theano.tensor.scalar(name, dtype=dtype)
+        x = tt.scalar(name, dtype=dtype)
     elif len(test_value_shape) == 1:
-        x = theano.tensor.vector(name, dtype=dtype)
+        x = tt.vector(name, dtype=dtype)
     elif len(test_value_shape) == 2:
-        x = theano.tensor.matrix(name, dtype=dtype)
+        x = tt.matrix(name, dtype=dtype)
     elif len(test_value_shape) == 3:
-        x = theano.tensor.tensor3(name, dtype=dtype)
+        x = tt.tensor3(name, dtype=dtype)
     else:
         raise Exception('Unsupported number of dimensions: ' + str(len(test_value_shape)))
 
@@ -404,8 +377,8 @@ def _var(name, test_value_shape, debug_name_prefix, debug_level, dtype=None,
     return x, _debug(x, '%s.%s' % (debug_name_prefix, name), debug_level)
 
 
-def _test_theano_compiled_dtw(input_size, hidden_size, ndim, distance_function, normalize, enable_grads,
-                              large_value, debug_level):
+def _test_theano_compiled_dtw(input_size, hidden_size, ndim, distance_function, normalize, enable_grads, debug_level,
+                              eps):
     """
     Performs a test of a Theano DTW implementation.
 
@@ -417,9 +390,8 @@ def _test_theano_compiled_dtw(input_size, hidden_size, ndim, distance_function, 
     :param normalize: Whether the DTW distances should be sequence length normalized.
     :param enable_grads: Whether gradients should be computed of a min mean DTW cost function with respect to some
                          synthetic parameters.
-    :param large_value: A value to stand in for positive infinity when padding the distances tensor. Can be numpy.inf if
-                        you don't care about gradients.
     :param debug_level: The debug level to use (see above for explanation).
+    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon by default.
     :return: A compiled Theano function that can be used to compute DTW distances between sequence pairs.
     """
 
@@ -448,31 +420,28 @@ def _test_theano_compiled_dtw(input_size, hidden_size, ndim, distance_function, 
     else:
         raise Exception('Unsupported number of dimensions: ' + str(ndim))
 
-    # Construct the symbolic expression for DTW
-    symbolic_dtw = theano_symbolic_dtw(x1, x2, x1_lengths, x2_lengths, distance_function=distance_function,
-                                       normalize=normalize, large_value=large_value, debug_level=debug_level)
-    outputs = [symbolic_dtw]
-
     if enable_grads:
         # Create some synthetic parameters
         w = framework.utility.shared_gaussian_random_matrix('w', input_size, hidden_size)
 
         # Transform the inputs using the synthetic parameters
-        z1 = _debug(theano.dot(x1, w), 'theano_compiled_dtw.z1', debug_level)
-        z2 = _debug(theano.dot(x2, w), 'theano_compiled_dtw.z2', debug_level)
+        x1 = _debug(theano.dot(x1, w), 'theano_compiled_dtw.z1', debug_level)
+        x2 = _debug(theano.dot(x2, w), 'theano_compiled_dtw.z2', debug_level)
+    else:
+        w = None
 
-        # Create a new DTW expression using the transformed inputs
-        symbolic_dtw = theano_symbolic_dtw(z1, z2, x1_lengths, x2_lengths, distance_function=distance_function,
-                                           normalize=normalize, large_value=large_value,
-                                           debug_level=debug_level)
+    # Construct the symbolic expression for DTW
+    symbolic_dtw = theano_symbolic_dtw(x1, x2, x1_lengths, x2_lengths, distance_function=distance_function,
+                                       normalize=normalize, debug_level=debug_level, eps=eps)
+    outputs = [symbolic_dtw]
 
+    if enable_grads:
         # Create a min mean DTW cost expression
-        cost = _debug(theano.tensor.mean(symbolic_dtw) if ndim == 3 else symbolic_dtw, 'theano_compiled_dtw.cost',
-                      debug_level, check_not_any_inf=True)
+        cost = _debug(tt.mean(symbolic_dtw) if ndim == 3 else symbolic_dtw, 'theano_compiled_dtw.cost', debug_level)
         outputs.append(cost)
 
         # Perform symbolic differentiation of the cost expression with respect to the synthetic parameters
-        outputs.append(_debug(theano.grad(cost, w), 'theano_compiled_dtw.w_grad', debug_level, check_not_any_inf=True))
+        outputs.append(_debug(theano.grad(cost, w), 'theano_compiled_dtw.w_grad', debug_level))
 
     return theano.function([x1_in, x2_in, x1_lengths_in, x2_lengths_in], outputs, name='compiled_dtw_' + str(ndim),
                            on_unused_input='ignore')
@@ -533,7 +502,7 @@ def theano_dtw(batch, compiled_dtw, pack_batch=True):
 
             outputs = compiled_dtw(packed_x1, packed_x2, x1_lengths, x2_lengths)
             _check_outputs(outputs)
-            return list(outputs[0])
+            return [float(output) for output in outputs[0]]
 
         # If we're not packing the batch then we need to submit them one at a time.
         results = []
@@ -622,8 +591,8 @@ def _test_cython_make_dtw_function(distance_mode, normalize):
                                                euclidean=lambda: lambda batch: cython_dtw_euclidean(batch, normalize)))
 
 
-def _test_theano_make_dtw_function(input_size, hidden_size, distance_mode, ndim, normalize, enable_grads, large_value,
-                                   debug_level):
+def _test_theano_make_dtw_function(input_size, hidden_size, distance_mode, ndim, normalize, enable_grads, debug_level,
+                                   eps):
     """
     Used during testing. A version of _test_common_make_dtw_function that is specific to the Theano implementations.
 
@@ -634,20 +603,19 @@ def _test_theano_make_dtw_function(input_size, hidden_size, distance_mode, ndim,
     :param normalize: Whether DTW distances should be length normalized.
     :param enable_grads: Whether gradients should be computed of a min mean DTW cost function with respect to some
                          synthetic parameters.
-    :param large_value: A value to stand in for positive infinity when padding the distances tensor. Can be numpy.inf if
-                        you don't care about gradients.
     :param debug_level: The debug level to use (see above for explanation).
+    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon by default.
     :return: The requested DTW function implementation.
     """
 
     def compile_distance_function(distance_function):
         compiled_distance_function = _test_theano_compiled_dtw(input_size, hidden_size, ndim, distance_function,
-                                                               normalize, enable_grads, large_value, debug_level)
+                                                               normalize, enable_grads, debug_level, eps)
         return lambda batch: theano_dtw(batch, compiled_distance_function, ndim == 3)
 
     return _test_common_make_dtw_function(
-        distance_mode, normalize, dict(cosine=lambda: compile_distance_function(framework.distance.cosine),
-                                       euclidean=lambda: compile_distance_function(framework.distance.euclidean)))
+        distance_mode, normalize, dict(cosine=lambda: compile_distance_function(cosine),
+                                       euclidean=lambda: compile_distance_function(euclidean)))
 
 
 def _test_rand_inputs(min_x1_length, max_x1_length, min_x2_length, max_x2_length, batch_size, input_size):
@@ -669,7 +637,7 @@ def _test_rand_inputs(min_x1_length, max_x1_length, min_x2_length, max_x2_length
 
 
 def _test_case(distance_mode, normalize, iterations, debug_level, min_x1_length, max_x1_length, min_x2_length,
-               max_x2_length, batch_size, input_size, hidden_size, enable_grads, large_value):
+               max_x2_length, batch_size, input_size, hidden_size, enable_grads, enable_value_checks, eps):
     """
     Executes a general test case. All three DTW implementations will be tested in the given configuration.
 
@@ -688,23 +656,24 @@ def _test_case(distance_mode, normalize, iterations, debug_level, min_x1_length,
     :param hidden_size: The size of the hidden values (used only if enable_grads=True).
     :param enable_grads: Whether gradients should be computed of a min mean DTW cost function with respect to some
                          synthetic parameters.
-    :param large_value: A value to stand in for positive infinity when padding the distances tensor. Can be numpy.inf if
-                        you don't care about gradients.
+    :param enable_value_checks: Whether numpy.allclose should be used to verify the values computed by the different DTW
+                                implementations.
+    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon by default.
     :return: None
     """
     print 'distance_mode: %s, normalize: %s, iterations: %s, debug_level: %s, min_x1_length: %s, max_x1_length: %s, ' \
           'min_x2_length: %s, max_x2_length: %s, batch_size: %s, input_size: %s, hidden_size: %s, enable_grads: %s, ' \
-          'large_value: %s' % (
+          'enable_value_checks: %s, eps: %s' % (
               distance_mode, normalize, iterations, debug_level, min_x1_length, max_x1_length, min_x2_length,
-              max_x2_length, batch_size, input_size, hidden_size, enable_grads, large_value)
+              max_x2_length, batch_size, input_size, hidden_size, enable_grads, enable_value_checks, eps)
     numpy.random.seed(1)
 
     dtw_functions = (
         _test_cython_make_dtw_function(distance_mode, normalize),
-        _test_theano_make_dtw_function(input_size, hidden_size, distance_mode, 2, normalize, enable_grads, large_value,
-                                       debug_level),
-        _test_theano_make_dtw_function(input_size, hidden_size, distance_mode, 3, normalize, enable_grads, large_value,
-                                       debug_level))
+        _test_theano_make_dtw_function(input_size, hidden_size, distance_mode, 2, normalize, enable_grads, debug_level,
+                                       eps),
+        _test_theano_make_dtw_function(input_size, hidden_size, distance_mode, 3, normalize, enable_grads, debug_level,
+                                       eps))
 
     numpy.random.seed(1)
 
@@ -730,10 +699,11 @@ def _test_case(distance_mode, normalize, iterations, debug_level, min_x1_length,
         if debug_level > 1:
             print 'Results', results_index, results
         for result_a, result_b in zip(results[:-1], results[1:]):
-            assert numpy.allclose(result_a, result_b), (result_a, result_b)
+            if enable_value_checks:
+                assert numpy.allclose(result_a, result_b), (result_a, result_b)
 
 
-def _test_main(debug_level, test_variations, enable_grads, large_value):
+def _test_main(debug_level, test_variations, enable_grads, enable_value_checks, eps):
     """
     Executes a sequence of test cases.
 
@@ -748,10 +718,9 @@ def _test_main(debug_level, test_variations, enable_grads, large_value):
                                loss function (min DTW) with respect to the parameter matrix are computed and tested.
                                Currently not working correctly. False: Inputs are passed directly to DTW without
                                transformation. Gradients are not computed. For testing the plain DTW operation.
-    :param large_value: A value to use as if it were the same as positive infinity. numpy.inf works fine as long as
-                        gradients are not wanted. If gradients are wanted, may need to change this value to a large
-                        finite value to help prevent unwanted NaNs or infs appearing in the gradient (e.g. set to
-                        1e300).
+    :param enable_value_checks: Whether numpy.allclose should be used to verify the values computed by the different DTW
+                                implementations.
+    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon by default.
     :return: None
     """
     os.environ['__THEANO_IMPORT_debug_level'] = str(debug_level)
@@ -762,20 +731,20 @@ def _test_main(debug_level, test_variations, enable_grads, large_value):
     if test_variations:
         for distance_mode in ['cosine', 'euclidean']:
             for normalize in [True, False]:
-                for iterations, batch_size in [(100, 1), (10, 10), (1, 100)]:
+                for iterations, batch_size in [(1000, 1), (100, 10), (10, 100), (1, 1000)]:
                     _test_case(distance_mode=distance_mode, normalize=normalize, iterations=iterations,
                                debug_level=debug_level, min_x1_length=80, max_x1_length=100, min_x2_length=110,
                                max_x2_length=130, batch_size=batch_size, input_size=39, hidden_size=39,
-                               enable_grads=enable_grads, large_value=large_value)
+                               enable_grads=enable_grads, enable_value_checks=enable_value_checks, eps=eps)
     else:
         _test_case(distance_mode='cosine', normalize=True, iterations=2, debug_level=debug_level, min_x1_length=5,
                    max_x1_length=10, min_x2_length=10, max_x2_length=15, batch_size=2, input_size=3, hidden_size=4,
-                   enable_grads=enable_grads, large_value=large_value)
+                   enable_grads=enable_grads, enable_value_checks=enable_value_checks, eps=eps)
         _test_case(distance_mode='euclidean', normalize=True, iterations=2, debug_level=debug_level, min_x1_length=5,
                    max_x1_length=10, min_x2_length=10, max_x2_length=15, batch_size=2, input_size=3, hidden_size=4,
-                   enable_grads=enable_grads, large_value=large_value)
+                   enable_grads=enable_grads, enable_value_checks=enable_value_checks, eps=eps)
 
 
 if __name__ == '__main__':
     print 'THEANO_FLAGS', os.environ['THEANO_FLAGS']
-    _test_main(debug_level=0, test_variations=True, enable_grads=False, large_value=numpy.inf)
+    _test_main(debug_level=0, test_variations=True, enable_grads=False, enable_value_checks=True, eps=None)

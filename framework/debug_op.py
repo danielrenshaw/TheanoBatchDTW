@@ -277,7 +277,10 @@ def debug(node, name, debug_level, check_not_all_nan=True, check_not_any_nan=Fal
     """
 
     node.name = name
-    result = Debug(name, debug_level, check_not_all_nan, check_not_any_nan, check_not_all_inf, check_not_any_inf,
-                   raise_on_failed_nan_check, raise_on_failed_inf_check)(node)
-    result.name = name
-    return result
+
+    if debug_level > 0:
+        node = Debug(name, debug_level, check_not_all_nan, check_not_any_nan, check_not_all_inf, check_not_any_inf,
+                     raise_on_failed_nan_check, raise_on_failed_inf_check)(node)
+        node.name = name
+
+    return node
