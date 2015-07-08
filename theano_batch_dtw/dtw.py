@@ -83,9 +83,9 @@ import theano.scan_module
 import theano.scan_module.scan_op
 import theano.tensor as tt
 import theano.tensor.extra_ops
-import framework.debug_op
-import framework.cython_dtw
-import framework.utility
+import debug_op
+import cython_dtw
+import utility
 
 DTYPE_INT64 = 'int64'
 
@@ -107,11 +107,10 @@ def _debug(node, name, debug_level, check_not_all_nan=True, check_not_any_nan=Tr
     :param raise_on_failed_inf_check: Whether an exception should be raised if an inf check fails.
     :return: The Debug wrapped node.
     """
-    return framework.debug_op.debug(node, name, debug_level, check_not_all_nan=check_not_all_nan,
-                                    check_not_any_nan=check_not_any_nan, check_not_all_inf=check_not_all_inf,
-                                    check_not_any_inf=check_not_any_inf,
-                                    raise_on_failed_nan_check=raise_on_failed_nan_check,
-                                    raise_on_failed_inf_check=raise_on_failed_inf_check)
+    return debug_op.debug(node, name, debug_level, check_not_all_nan=check_not_all_nan,
+                          check_not_any_nan=check_not_any_nan, check_not_all_inf=check_not_all_inf,
+                          check_not_any_inf=check_not_any_inf, raise_on_failed_nan_check=raise_on_failed_nan_check,
+                          raise_on_failed_inf_check=raise_on_failed_inf_check)
 
 
 def _create_dtw_inner_step(debug_level):
@@ -140,8 +139,8 @@ def _create_dtw_inner_step(debug_level):
         assert delete_cost.ndim == d_slice_slice.ndim
         assert match_cost.ndim == d_slice_slice.ndim
 
-        min_cost = _debug(tt.min(tt.stack(insert_cost, delete_cost, match_cost), axis=0),
-                          'dtw_inner_step.min_cost', debug_level)
+        min_cost = _debug(tt.min(tt.stack(insert_cost, delete_cost, match_cost), axis=0), 'dtw_inner_step.min_cost',
+                          debug_level)
         assert min_cost.ndim == d_slice_slice.ndim
 
         in_first_row = _debug(tt.eq(x1_index, 0), 'dtw_inner_step.in_first_row', debug_level)
@@ -169,7 +168,7 @@ def _create_dtw_outer_step(distance_function, debug_level):
     Creates a DTW outer step function given requested configuration settings.
 
     :param distance_function: A symbolic function for computing the distance between sequence elements such as those
-                              found in framework.distance (e.g. cosine, Euclidean, etc.).
+                              found in distance (e.g. cosine, Euclidean, etc.).
     :param debug_level: The debug level to use (see above for explanation).
     :return: A function that can be used inside theano.scan to compute the DTW outer steps.
     """
@@ -188,11 +187,9 @@ def _create_dtw_outer_step(distance_function, debug_level):
         previous_cost_row = _debug(previous_cost_row, 'dtw_outer_step.previous_cost_row', debug_level)
 
         x2_indexes = tt.arange(d_slice.shape[0], dtype=DTYPE_INT64)
-        results, _ = theano.scan(
-            _create_dtw_inner_step(debug_level),
-            sequences=[x2_indexes, d_slice],
-            outputs_info=[tt.zeros_like(d_slice[0], dtype=theano.config.floatX)],
-            non_sequences=[x1_length, x2_length, x1_index, previous_cost_row])
+        results, _ = theano.scan(_create_dtw_inner_step(debug_level), sequences=[x2_indexes, d_slice],
+                                 outputs_info=[tt.zeros_like(d_slice[0], dtype=theano.config.floatX)],
+                                 non_sequences=[x1_length, x2_length, x1_index, previous_cost_row])
         return results
 
     return dtw_outer_step
@@ -257,7 +254,7 @@ def theano_symbolic_dtw(x1, x2, x1_lengths, x2_lengths, distance_function=cosine
     :param x1_lengths: An integer vector identifying the lengths of the sequences in x1
     :param x2_lengths: An integer vector identifying the lengths of the sequences in x2
     :param distance_function: The symbolic distance function to use (e.g. a reference to a function in
-                              framework.distance).
+                              distance).
     :param normalize: Whether the DTW distances should be sequence length normalized.
     :param debug_level: The debug level to use (see above for explanation).
     :param eps: The minimum value to use inside the distance function. Set to the machine epsilon by default.
@@ -284,11 +281,10 @@ def theano_symbolic_dtw(x1, x2, x1_lengths, x2_lengths, distance_function=cosine
     # Iterate over the temporal slices of x2. See dtw_outer_step for an explanation of the other inputs to this scan
     # operation
     x1_indexes = tt.arange(x1.shape[0], dtype=DTYPE_INT64)
-    results, _ = theano.scan(
-        _create_dtw_outer_step(distance_function, debug_level),
-        sequences=[x1_indexes, d],
-        outputs_info=[tt.zeros_like(x2[:, :, 0] if x2.ndim == 3 else x2[:, 0], dtype=theano.config.floatX)],
-        non_sequences=[x1_lengths, x2_lengths])
+    results, _ = theano.scan(_create_dtw_outer_step(distance_function, debug_level), sequences=[x1_indexes, d],
+                             outputs_info=[
+                                 tt.zeros_like(x2[:, :, 0] if x2.ndim == 3 else x2[:, 0], dtype=theano.config.floatX)],
+                             non_sequences=[x1_lengths, x2_lengths])
     result = results[x1_lengths - 1, x2_lengths - 1, tt.arange(x1.shape[1])] if x2.ndim == 3 else results[
         x1_lengths - 1, x2_lengths - 1]
     result = _debug(result, 'theano_symbolic_dtw.result', debug_level)
@@ -296,7 +292,7 @@ def theano_symbolic_dtw(x1, x2, x1_lengths, x2_lengths, distance_function=cosine
 
     # Length normalize the distances if requested to do so
     if normalize:
-        result = _debug(result / tt.cast(x1_lengths + x2_lengths, dtype=framework.utility.get_standard_dtype()),
+        result = _debug(result / tt.cast(x1_lengths + x2_lengths, dtype=utility.get_standard_dtype()),
                         'theano_symbolic_dtw.norm_result', debug_level)
 
     return result
@@ -347,13 +343,13 @@ def _var(name, test_value_shape, debug_name_prefix, debug_level, dtype=None,
     :param debug_name_prefix: Used in naming the Debug operation.
     :param debug_level: The debug level to use (see above for explanation).
     :param dtype: The type of the variable being created. Defaults to whatever is returned by
-                  framework.utility.get_standard_dtype.
+                  utility.get_standard_dtype.
     :param test_value_getter: A method for generating test values. Defaults to zero mean unit variance Gaussian values.
     :return: The newly created Theano variable.
     """
 
     if dtype is None:
-        dtype = framework.utility.get_standard_dtype()
+        dtype = utility.get_standard_dtype()
 
     if len(test_value_shape) == 0:
         x = tt.scalar(name, dtype=dtype)
@@ -386,7 +382,7 @@ def _test_theano_compiled_dtw(input_size, hidden_size, ndim, distance_function, 
     :param hidden_size: The size of the hidden values (used only if enable_grads=True).
     :param ndim: The number of dimensions to use (2: non-batched, 3: batched).
     :param distance_function: The symbolic distance function to use (e.g. a reference to a function in
-                              framework.distance).
+                              distance).
     :param normalize: Whether the DTW distances should be sequence length normalized.
     :param enable_grads: Whether gradients should be computed of a min mean DTW cost function with respect to some
                          synthetic parameters.
@@ -422,7 +418,7 @@ def _test_theano_compiled_dtw(input_size, hidden_size, ndim, distance_function, 
 
     if enable_grads:
         # Create some synthetic parameters
-        w = framework.utility.shared_gaussian_random_matrix('w', input_size, hidden_size)
+        w = utility.shared_gaussian_random_matrix('w', input_size, hidden_size)
 
         # Transform the inputs using the synthetic parameters
         x1 = _debug(theano.dot(x1, w), 'theano_compiled_dtw.z1', debug_level)
@@ -478,7 +474,7 @@ def theano_dtw(batch, compiled_dtw, pack_batch=True):
 
     assert compiled_dtw is not None
     assert isinstance(pack_batch, bool)
-    dtype = framework.utility.get_standard_dtype()
+    dtype = utility.get_standard_dtype()
 
     def dtw(validated_batch):
         if pack_batch:
@@ -543,7 +539,7 @@ def cython_dtw_cosine(batch, normalize=True):
     :return: The resulting DTW distances.
     """
 
-    return _cython_dtw(batch, normalize, framework.cython_dtw.multivariate_dtw_cost_cosine)
+    return _cython_dtw(batch, normalize, cython_dtw.multivariate_dtw_cost_cosine)
 
 
 def cython_dtw_euclidean(batch, normalize=True):
@@ -555,7 +551,7 @@ def cython_dtw_euclidean(batch, normalize=True):
     :return: The resulting DTW distances.
     """
 
-    return _cython_dtw(batch, normalize, framework.cython_dtw.multivariate_dtw_cost_euclidean)
+    return _cython_dtw(batch, normalize, cython_dtw.multivariate_dtw_cost_euclidean)
 
 
 def _test_common_make_dtw_function(distance_mode, normalize, dtw_functions):
@@ -613,9 +609,9 @@ def _test_theano_make_dtw_function(input_size, hidden_size, distance_mode, ndim,
                                                                normalize, enable_grads, debug_level, eps)
         return lambda batch: theano_dtw(batch, compiled_distance_function, ndim == 3)
 
-    return _test_common_make_dtw_function(
-        distance_mode, normalize, dict(cosine=lambda: compile_distance_function(cosine),
-                                       euclidean=lambda: compile_distance_function(euclidean)))
+    return _test_common_make_dtw_function(distance_mode, normalize,
+                                          dict(cosine=lambda: compile_distance_function(cosine),
+                                               euclidean=lambda: compile_distance_function(euclidean)))
 
 
 def _test_rand_inputs(min_x1_length, max_x1_length, min_x2_length, max_x2_length, batch_size, input_size):
@@ -631,9 +627,9 @@ def _test_rand_inputs(min_x1_length, max_x1_length, min_x2_length, max_x2_length
     :return: The list of pairs containing the synthetic data for the requested batch.
     """
 
-    return [(framework.utility.gaussian_random_matrix(numpy.random.randint(min_x1_length, max_x1_length), input_size),
-             framework.utility.gaussian_random_matrix(numpy.random.randint(min_x2_length, max_x2_length), input_size))
-            for _ in xrange(batch_size)]
+    return [(utility.gaussian_random_matrix(numpy.random.randint(min_x1_length, max_x1_length), input_size),
+             utility.gaussian_random_matrix(numpy.random.randint(min_x2_length, max_x2_length), input_size)) for _ in
+            xrange(batch_size)]
 
 
 def _test_case(distance_mode, normalize, iterations, debug_level, min_x1_length, max_x1_length, min_x2_length,
@@ -668,18 +664,16 @@ def _test_case(distance_mode, normalize, iterations, debug_level, min_x1_length,
               max_x2_length, batch_size, input_size, hidden_size, enable_grads, enable_value_checks, eps)
     numpy.random.seed(1)
 
-    dtw_functions = (
-        _test_cython_make_dtw_function(distance_mode, normalize),
-        _test_theano_make_dtw_function(input_size, hidden_size, distance_mode, 2, normalize, enable_grads, debug_level,
-                                       eps),
-        _test_theano_make_dtw_function(input_size, hidden_size, distance_mode, 3, normalize, enable_grads, debug_level,
-                                       eps))
+    dtw_functions = (_test_cython_make_dtw_function(distance_mode, normalize),
+                     _test_theano_make_dtw_function(input_size, hidden_size, distance_mode, 2, normalize, enable_grads,
+                                                    debug_level, eps),
+                     _test_theano_make_dtw_function(input_size, hidden_size, distance_mode, 3, normalize, enable_grads,
+                                                    debug_level, eps))
 
     numpy.random.seed(1)
 
-    all_inputs = [
-        _test_rand_inputs(min_x1_length, max_x1_length, min_x2_length, max_x2_length, batch_size, input_size) for _ in
-        xrange(iterations)]
+    all_inputs = [_test_rand_inputs(min_x1_length, max_x1_length, min_x2_length, max_x2_length, batch_size, input_size)
+                  for _ in xrange(iterations)]
     all_results = [[] for _ in xrange(iterations)]
 
     for function_index, dtw_function in enumerate(dtw_functions):

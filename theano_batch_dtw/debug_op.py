@@ -17,8 +17,9 @@ import theano.gof
 class Debug(theano.gof.Op):
     view_map = {0: [0]}
 
-    __props__ = ('name', 'debug_level', 'check_not_all_nan', 'check_not_any_nan', 'check_not_all_inf',
-                 'check_not_any_inf', 'raise_on_failed_nan_check', 'raise_on_failed_inf_check')
+    __props__ = (
+        'name', 'debug_level', 'check_not_all_nan', 'check_not_any_nan', 'check_not_all_inf', 'check_not_any_inf',
+        'raise_on_failed_nan_check', 'raise_on_failed_inf_check')
 
     def _check(self, check_not_all, check_not_any, masker, value, prefix):
         """
@@ -94,14 +95,8 @@ class Debug(theano.gof.Op):
             if node is not None:
                 print '*** %s pp:' % name
                 print theano.printing.pp(node)
-                print '*** %s debugprint (all):' % name
-                print theano.printing.debugprint(node, ids='id', print_type=True, include_nan_info=True,
-                                                 include_inf_info=True, print_test_value=True)
-                print '*** %s debugprint (limited):' % name
-                print theano.printing.debugprint(node, ids='id', print_type=True, include_nan_info=True,
-                                                 include_inf_info=True,
-                                                 recursion_rules='SOME_NANS,ALL_NANS,NO_TEST_VALUE',
-                                                 print_test_value=True)
+                print '*** %s debugprint:' % name
+                print theano.printing.debugprint(node, ids='id', print_type=True)
 
             exception = Exception('Failed %s %s check' % (name, check_type))
 
