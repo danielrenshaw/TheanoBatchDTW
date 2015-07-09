@@ -68,10 +68,12 @@ column for each position in x2.
 import os
 import time
 
-os.environ['THEANO_FLAGS'] = 'device=cpu,openmp=True,floatX=float64'
-# os.environ['THEANO_FLAGS'] = 'device=cpu,openmp=False,floatX=float32,warn_float64=raise,compute_test_value=raise,' \
-#                              'on_opt_error=raise,on_shape_error=raise,numpy.seterr_all=warn,optimizer=None,' \
-#                              'exception_verbosity=high'
+if __name__ == '__main__':
+    # os.environ['THEANO_FLAGS'] = 'device=cpu,openmp=True,floatX=float64'
+    os.environ['THEANO_FLAGS'] = 'device=cpu,openmp=True,floatX=float32,warn_float64=raise'
+    # os.environ['THEANO_FLAGS'] = 'device=cpu,openmp=False,floatX=float32,warn_float64=raise,compute_test_value=raise,' \
+    #                              'on_opt_error=raise,on_shape_error=raise,numpy.seterr_all=warn,optimizer=None,' \
+    #                              'exception_verbosity=high'
 
 import numpy
 
@@ -241,7 +243,7 @@ def cosine(x1, x2, eps):
 
 
 def theano_symbolic_dtw(x1, x2, x1_lengths, x2_lengths, distance_function=cosine, normalize=True, debug_level=None,
-                        eps=numpy.finfo(float).eps):
+                        eps=None):
     """
     A symbolic implementation of DTW that supports batches of sequence pairs.
 
@@ -257,12 +259,12 @@ def theano_symbolic_dtw(x1, x2, x1_lengths, x2_lengths, distance_function=cosine
                               distance).
     :param normalize: Whether the DTW distances should be sequence length normalized.
     :param debug_level: The debug level to use (see above for explanation).
-    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon by default.
+    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon if None.
     :return: The DTW distances for every sequence pair in the batch.
     """
 
     if eps is None:
-        eps = numpy.finfo(float).eps
+        eps = numpy.dtype(theano.config.floatX).type(numpy.finfo(float).eps)
 
     assert 0 <= x1_lengths.ndim == x2_lengths.ndim <= 1
     assert isinstance(normalize, bool)
@@ -387,7 +389,7 @@ def _test_theano_compiled_dtw(input_size, hidden_size, ndim, distance_function, 
     :param enable_grads: Whether gradients should be computed of a min mean DTW cost function with respect to some
                          synthetic parameters.
     :param debug_level: The debug level to use (see above for explanation).
-    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon by default.
+    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon if None.
     :return: A compiled Theano function that can be used to compute DTW distances between sequence pairs.
     """
 
@@ -600,7 +602,7 @@ def _test_theano_make_dtw_function(input_size, hidden_size, distance_mode, ndim,
     :param enable_grads: Whether gradients should be computed of a min mean DTW cost function with respect to some
                          synthetic parameters.
     :param debug_level: The debug level to use (see above for explanation).
-    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon by default.
+    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon if None.
     :return: The requested DTW function implementation.
     """
 
@@ -654,7 +656,7 @@ def _test_case(distance_mode, normalize, iterations, debug_level, min_x1_length,
                          synthetic parameters.
     :param enable_value_checks: Whether numpy.allclose should be used to verify the values computed by the different DTW
                                 implementations.
-    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon by default.
+    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon if None.
     :return: None
     """
     print 'distance_mode: %s, normalize: %s, iterations: %s, debug_level: %s, min_x1_length: %s, max_x1_length: %s, ' \
@@ -714,7 +716,7 @@ def _test_main(debug_level, test_variations, enable_grads, enable_value_checks, 
                                transformation. Gradients are not computed. For testing the plain DTW operation.
     :param enable_value_checks: Whether numpy.allclose should be used to verify the values computed by the different DTW
                                 implementations.
-    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon by default.
+    :param eps: The minimum value to use inside the distance function. Set to the machine epsilon if None.
     :return: None
     """
     os.environ['__THEANO_IMPORT_debug_level'] = str(debug_level)
@@ -741,4 +743,4 @@ def _test_main(debug_level, test_variations, enable_grads, enable_value_checks, 
 
 if __name__ == '__main__':
     print 'THEANO_FLAGS', os.environ['THEANO_FLAGS']
-    _test_main(debug_level=0, test_variations=True, enable_grads=False, enable_value_checks=True, eps=None)
+    _test_main(debug_level=1, test_variations=False, enable_grads=True, enable_value_checks=False, eps=None)
